@@ -1,0 +1,162 @@
+name: CI — Static Analysis (build-free)
+
+# Build-free static-analysis pipeline. This workflow NEVER runs the application stack.
+# tests/ are NOT run here — they are live-stack integration tests (they import openai +
+# httpx and hit running endpoints such as vLLM /health, MCPHub tools, and a running
+# Postgres/MinIO/Casdoor stack). The full stack needs an NVIDIA GPU for the vllm service
+# and a 300s start_period, so it cannot run on a standard GitHub-hosted runner.
+# No `docker build`, `docker compose up`/`run`, deploy, or pytest is invoked anywhere here.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint-dockerfiles:
+    name: Hadolint — Lint Dockerfiles
+    runs-on: ubuntu-latest
+    steps:
+      # full history; default shallow clone limits git-based checks
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # warn-only: FROM samanhappy/mcphub:latest (line 1) flags DL3007; USER root +
+      # docker.io / gcc install at runtime are genuine hardening / supply-chain findings
+      - name: Lint dockerfiles/mcphub.Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: dockerfiles/mcphub.Dockerfile
+        continue-on-error: true
+
+      # warn-only: kubectl/eksctl/zellij fetched from /releases/latest/ URLs with no
+      # checksum, plus NOPASSWD sudo — real findings flagged without blocking the run
+      - name: Lint dockerfiles/sandbox.Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: dockerfiles/sandbox.Dockerfile
+        continue-on-error: true
+
+  validate-compose:
+    name: Compose — schema + interpolation validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Safe: .gitignore already ignores .env so this copy is never committed to git, and
+      # .env.example holds only placeholder / example values, not real secrets. The one
+      # var absent from .env.example (OPENAPI_MCP_HEADERS) gets an inline placeholder.
+      - name: Supply dummy values for interpolated compose variables
+        run: |
+          cp .env.example .env
+          echo "OPENAPI_MCP_HEADERS=placeholder" >> .env
+
+      # config -q checks schema + ${VAR} interpolation only — never up / build / run
+      - name: Validate compose (config -q, not up/build)
+        run: docker compose -f docker-compose.yml config -q
+
+  lint-yaml-and-workflow:
+    name: yamllint + actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install yamllint
+        run: pip install yamllint
+
+      # warn-only: docker-compose.yml has intentionally long env-var assignment lines
+      - name: yamllint — docker-compose.yml and ci.yml
+        run: |
+          yamllint \
+            -d "{extends: default, rules: {line-length: {max: 160, level: warning}, truthy: disable, comments: {min-spaces-from-content: 1}}}" \
+            docker-compose.yml .github/workflows/ci.yml
+        continue-on-error: true
+
+      - name: Download actionlint v1.7.3
+        run: |
+          curl -fsSL -o /tmp/actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v1.7.3/actionlint_1.7.3_linux_amd64.tar.gz"
+          tar -xzf /tmp/actionlint.tar.gz -C /tmp actionlint
+          sudo mv /tmp/actionlint /usr/local/bin/actionlint
+
+      # warn-only: self-lints ci.yml; surfaced findings do not block the run
+      - name: actionlint — validate this workflow file
+        run: actionlint .github/workflows/ci.yml
+        continue-on-error: true
+
+  scan-secrets:
+    name: Gitleaks — secret scan
+    runs-on: ubuntu-latest
+    steps:
+      # full history required; a shallow clone scans only the tip commit and misses
+      # historical secret leaks
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download gitleaks v8.18.2
+        run: |
+          curl -fsSL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v8.18.2/gitleaks_8.18.2_linux_x64.tar.gz"
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks
+
+      # warn-only: .gitignore already excludes .env, aws_credentials.yaml, *.pem and
+      # config/ssh/, so on a clean tree gitleaks finds nothing committed. It is a safety
+      # net for FUTURE accidental leaks — not a claim that secrets are committed today.
+      - name: Scan git history for committed secrets
+        run: gitleaks detect --source . --no-banner --redact
+        continue-on-error: true
+
+  trivy-scan:
+    name: Trivy — vulnerability and misconfiguration scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # warn-only: surfaces dependency CVEs without failing the run
+      - name: Trivy — filesystem scan (dependency CVEs)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          exit-code: "0"
+        continue-on-error: true
+
+      # warn-only: flags sslmode=disable in Casdoor DSN (docker-compose.yml line 13),
+      # :latest images on qdrant/minio, and USER root in mcphub.Dockerfile — surfaced
+      # without blocking the run
+      - name: Trivy — config scan (Dockerfile + Compose misconfigurations)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          exit-code: "0"
+        continue-on-error: true
+
+  check-commits:
+    name: Conventional Commits (cz check)
+    runs-on: ubuntu-latest
+    steps:
+      # full history needed so --rev-range can resolve origin/main
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Sync dev dependencies (commitizen)
+        run: uv sync --group dev
+
+      # Mirrors the existing local gate .githooks/commit-msg, which runs
+      # `uv run cz check --commit-msg-file "$1"`. That --commit-msg-file path only exists
+      # in the local git hook context, so in CI we use a bounded --rev-range instead: it
+      # lints only the NEW commits on this branch (origin/main..HEAD), not the repo's
+      # pre-existing non-conventional history. The explicit fetch guarantees the
+      # origin/main ref exists on the runner before the range is resolved.
+      - name: Check conventional commits (bounded to this branch's new commits)
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          uv run cz check --rev-range origin/main..HEAD
