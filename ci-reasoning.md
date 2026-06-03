@@ -2,13 +2,25 @@
 
 ## Evidence of Workflow Run
 
-<!-- Screenshot will be added after the first push and Actions run completes -->
-
 ![GitHub Actions run](docs/evidence/ci/actions-run.png)
 
-**Actions run URL:** <!-- ADD AFTER PUSH: https://github.com/victorperez22/lobechat-aws/actions/runs/XXXXXXXX -->
+**Actions run URL:** https://github.com/victorperez22/lobechat-aws/actions/runs/26870561860
 
-**Commit SHA this run executed against:** <!-- ADD AFTER PUSH: run `git log -1 --pretty=%H` -->
+**Commit SHA this run executed against:** `7a69780d8beabbfe9adec2be4fe36d3c44bf7495`
+
+**Result:** ✅ all 6 jobs succeeded, every gate executed (none skipped). The
+findings-producing gates (hadolint, trivy, gitleaks, yamllint, actionlint) are
+warn-only, so they surface their findings in the job logs without failing the
+run; the two blocking gates (`docker compose config -q` and `cz check`) passed.
+
+| Job                                          | Conclusion             |
+| -------------------------------------------- | ---------------------- |
+| Hadolint — Lint Dockerfiles (both)           | ✅ success (warn-only) |
+| Compose — schema + interpolation (config -q) | ✅ success (blocking)  |
+| yamllint + actionlint                        | ✅ success (warn-only) |
+| Gitleaks — secret scan                       | ✅ success (warn-only) |
+| Trivy — fs + config scan                     | ✅ success (warn-only) |
+| Conventional Commits (cz check)              | ✅ success (blocking)  |
 
 ---
 
