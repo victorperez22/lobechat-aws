@@ -1,11 +1,19 @@
 # Data directories (contain runtime data)
 data/
 
+# Local deployment state, SSH keys, infra IDs (never commit)
+.deploy/
+
+# GSD/agent planning scratch dir (not part of submission)
+.planning/
+
 # Downloaded binaries
 contrib/
 
 # Environment files with secrets
 .env
+db/flyway/.env.flyway
+db/flyway/.build/
 
 # Python
 __pycache__/

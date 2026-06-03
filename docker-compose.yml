@@ -18,13 +18,15 @@ services:
     restart: unless-stopped
 
   lobe-chat:
-    image: lobehub/lobe-chat-database
+    image: lobehub/lobe-chat-database:1.143.3
     container_name: lobe-chat
     ports:
       - "${LOBECHAT_PORT:-47000}:3210"
-    volumes:
-      # HOTFIX: Patch MCP callTool to add session retry logic
-      - ./patches/route.js:/app/.next/server/app/(backend)/trpc/tools/[trpc]/route.js:ro
+    # NOTE: patches/route.js (the MCP callTool session-retry hotfix) is intentionally
+    # NOT mounted. It was pre-built for an older LobeChat and references a webpack chunk
+    # (chunks/89024.js) absent in 1.143.3 — mounting it crashes the MCP tools route and
+    # surfaces as "response.undefined" on every tool call. The pinned 1.143.3 image
+    # handles MCP callTool natively, so the stock route is used instead.
     environment:
       # App configuration
       - APP_URL=http://${HOST_DOMAIN:-localhost}:${LOBECHAT_PORT:-47000}
@@ -60,6 +62,8 @@ services:
       # Embedding model configuration
       - DEFAULT_FILES_CONFIG=embedding_model=openai/text-embedding-3-small
       - LLM_VISION_IMAGE_USE_BASE64=1
+      # Suppress changelog modal + update-check redirect on every page load
+      - FEATURE_FLAGS=-changelog,-check_updates
     restart: unless-stopped
     depends_on:
       postgres:
@@ -68,11 +72,12 @@ services:
         condition: service_started
       minio:
         condition: service_healthy
-      vllm:
-        condition: service_healthy
 
   mcphub:
-    image: samanhappy/mcphub:latest
+    build:
+      context: .
+      dockerfile: dockerfiles/mcphub.Dockerfile
+    image: lobechat-aws-mcphub:latest
     container_name: mcphub
     ports:
       - "${MCPHUB_PORT:-47008}:3000"
@@ -88,6 +93,8 @@ services:
       # AWS region config (credentials read from mounted ~/.aws)
       - AWS_REGION=${AWS_REGION:-eu-west-1}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-eu-west-1}
+      # Notion MCP integration token (Bearer header)
+      - OPENAPI_MCP_HEADERS=${OPENAPI_MCP_HEADERS}
     volumes:
       - ./config/mcp_settings.json:/app/mcp_settings.json
       - ./data/mcphub:/app/data
@@ -98,9 +105,58 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     restart: unless-stopped
 
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    ports:
+      - "${QDRANT_PORT:-47010}:6333"
+      - "${QDRANT_GRPC_PORT:-47011}:6334"
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  hayhooks:
+    image: deepset/hayhooks:v1.1.0
+    container_name: hayhooks
+    ports:
+      - "${HAYHOOKS_PORT:-47012}:1416"
+    environment:
+      - HAYHOOKS_HOST=0.0.0.0
+      - HAYHOOKS_PORT=1416
+      - QDRANT_URL=http://qdrant:6333
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    restart: unless-stopped
+
+  hayhooks-mcp:
+    image: deepset/hayhooks:v1.1.0
+    container_name: hayhooks-mcp
+    ports:
+      - "${HAYHOOKS_MCP_PORT:-47013}:1417"
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+    entrypoint: ["sh", "-c"]
+    command:
+      [
+        "pip install --no-cache-dir 'hayhooks[mcp]==1.1.0' && exec hayhooks mcp run --host 0.0.0.0 --port 1417 --json-response",
+      ]
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    restart: unless-stopped
+
   vllm:
-    image: vllm/vllm-openai:latest
+    image: vllm/vllm-openai:gemma4
     container_name: vllm
+    # GPU-only service. Not started by default (needs an NVIDIA GPU host).
+    # The AWS deployment uses Amazon Bedrock instead. Start with: --profile gpu
+    profiles: ["gpu"]
     ports:
       - "${VLLM_PORT:-47007}:8000"
     environment:
@@ -108,10 +164,14 @@ services:
     volumes:
       - ./data/huggingface:/root/.cache/huggingface
     command: >
-      --model ${VLLM_MODEL_ID:-oriolrius/myemoji-gemma-3-270m-it}
+      --model ${VLLM_MODEL_ID:-google/gemma-4-E4B-it}
       --trust-remote-code
-      --max-model-len 4096
+      --max-model-len 32768
+      --dtype bfloat16
       --gpu-memory-utilization 0.9
+      --enable-auto-tool-choice
+      --tool-call-parser gemma4
+      --reasoning-parser gemma4
     deploy:
       resources:
         reservations:
@@ -125,14 +185,14 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 120s
+      start_period: 300s
 
   minio:
     image: minio/minio:latest
     container_name: minio
     ports:
-      - "${MINIO_PORT:-47005}:9000"      # S3 API
-      - "${MINIO_CONSOLE_PORT:-47006}:9001"      # MinIO Console
+      - "${MINIO_PORT:-47005}:9000" # S3 API
+      - "${MINIO_CONSOLE_PORT:-47006}:9001" # MinIO Console
     volumes:
       - ./data/minio:/data
     environment:
@@ -147,6 +207,20 @@ services:
       timeout: 5s
       retries: 5
 
+  linux-sandbox:
+    build:
+      context: .
+      dockerfile: dockerfiles/sandbox.Dockerfile
+    image: lobechat-aws-linux-sandbox:latest
+    container_name: linux-sandbox
+    # Host-specific bind mount (/home/oriol/.ssh) — not started by default.
+    # Start with: --profile sandbox  (only on a host where that path exists)
+    profiles: ["sandbox"]
+    volumes:
+      - /home/oriol/.ssh:/home/oriol/.ssh
+    restart: unless-stopped
+    # Idle container; commands are exec'd in via the linux-sandbox MCP server
+    command: ["tail", "-f", "/dev/null"]
 
   postgres:
     image: pgvector/pgvector:pg16
